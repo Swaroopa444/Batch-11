@@ -1,0 +1,180 @@
+import pytesseract
+import cv2
+import numpy as np
+import os
+import re
+import RPi.GPIO as GPIO
+from gtts import gTTS
+from datetime import datetime
+import pytz
+import time
+import subprocess
+import requests
+
+# --- Hardware Setup ---
+# Time button is on GPIO 5 (Physical Pin 29). DO NOT USE PIN 15.
+BTN_OCR, BTN_OBJ, BTN_TIME, BTN_DIST, BTN_HELP = 27, 17, 5, 25, 26 
+TRIG, ECHO = 23, 24
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+for pin in [BTN_OCR, BTN_OBJ, BTN_TIME, BTN_DIST, BTN_HELP]:
+    GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
+# --- Model Loading ---
+PROTOTXT = "deploy.prototxt"
+MODEL = "mobilenet_iter_73000.caffemodel"
+CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "diningtable", "dog", "horse", "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor", "mobile phone"]
+net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
+
+def speak(text, lang="en"):
+    if not text.strip(): return
+    print(f"Diya: {text}")
+    tts = gTTS(text=text, lang=lang)
+    tts.save("voice.mp3")
+    subprocess.Popen(["mpg123", "-q", "voice.mp3"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def get_distance():
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    start_time = time.time()
+    stop_time = time.time()
+    timeout = time.time() + 1.0 
+
+    while GPIO.input(ECHO) == 0 and time.time() < timeout:
+        start_time = time.time()
+    while GPIO.input(ECHO) == 1 and time.time() < timeout:
+        stop_time = time.time()
+
+    duration = stop_time - start_time
+    distance = (duration * 34300) / 2
+    return round(distance, 1)
+
+def run_ocr(frame):
+    print("Action: Enhanced OCR Scan...")
+    cv2.imwrite("debug.jpg", frame) 
+    
+    h, w = frame.shape[:2]
+    roi = frame[int(h*0.15):int(h*0.85), int(w*0.15):int(w*0.85)]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    
+    scaled = cv2.resize(sharpened, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
+    text = pytesseract.image_to_string(scaled, lang="eng+hin+tel").strip()
+    
+    if text:
+        hi = len(re.findall(r'[\u0900-\u097F]', text))
+        te = len(re.findall(r'[\u0C00-\u0C7F]', text))
+        lang = "te" if te > 5 else ("hi" if hi > 5 else "en")
+        speak(text, lang)
+    else:
+        speak("No text detected.")
+
+def run_vision(frame):
+    print("Action: Object Detection...")
+    cv2.imwrite("debug.jpg", frame) 
+    
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+    net.setInput(blob)
+    detections = net.forward()
+    for i in range(detections.shape[2]):
+        if detections[0, 0, i, 2] > 0.5:
+            label = CLASSES[int(detections[0, 0, i, 1])]
+            speak(f"I see a {label}")
+            return
+    speak("I am not sure what that is.")
+
+def tell_time():
+    print("Action: Telling Time...")
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    speak(f"India time is {now.strftime('%I:%M %p')}")
+
+def provide_help(emergency=False):
+    if emergency:
+        print("Action: EMERGENCY BLYNK NOTIFICATION")
+        os.system("amixer sset Master 100%")
+        speak("Emergency triggered. Attempting network connection.", lang="en")
+        
+        try:
+            blynk_token = 'JJYyaZqWuhM7jMRMPcmQP_CKzhNkcUL_'
+
+            url = f"https://blynk.cloud/external/api/logEvent?token={blynk_token}&code=emergency"
+            
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                print("Blynk notification dispatched.")
+                speak("Alert sent successfully.", lang="en")
+            else:
+                print(f"Blynk API rejected call. Status: {response.status_code}")
+                speak("Network rejected the signal.", lang="en")
+                
+        except Exception as e:
+            print(f"CRITICAL FAILURE: {e}")
+            speak("Network failed. Cannot send signal.", lang="en")
+            
+    else:
+        print("Action: Providing Instructions...")
+        speak("Help mode active.")
+        time.sleep(1.5)
+        speak("Button one: Objects. Button two: Text. Button three: Time. Button four: Distance. Hold fifth button for emergency.")
+
+# --- Main Loop ---
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+time.sleep(1) 
+speak("Hello, I am Diya. I am online and ready.")
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret: continue
+
+        if GPIO.input(BTN_OBJ) == GPIO.LOW:
+            run_vision(frame)
+            time.sleep(0.5)
+
+        if GPIO.input(BTN_OCR) == GPIO.LOW:
+            run_ocr(frame)
+            time.sleep(0.5)
+
+        if GPIO.input(BTN_TIME) == GPIO.LOW:
+            tell_time()
+            time.sleep(0.5)
+            
+        if GPIO.input(BTN_DIST) == GPIO.LOW:
+            dist = get_distance()
+            speak(f"Obstacle is {dist} centimeters away")
+            time.sleep(0.5)
+
+        if GPIO.input(BTN_HELP) == GPIO.LOW:
+            press_start = time.time()
+            is_emergency = False
+            
+            while GPIO.input(BTN_HELP) == GPIO.LOW:
+                if time.time() - press_start > 3:
+                    is_emergency = True
+                    break
+                    
+            if is_emergency:
+                provide_help(emergency=True)
+            else:
+                provide_help(emergency=False)
+                
+            time.sleep(0.5)
+
+        time.sleep(0.05) 
+
+except KeyboardInterrupt:
+    pass
+finally:
+    GPIO.cleanup()
+    cap.release()
